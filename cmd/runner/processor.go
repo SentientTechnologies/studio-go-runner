@@ -178,20 +178,22 @@ func newProcessor(ctx context.Context, group string, msg []byte, creds string) (
 	// inspecting the artifacts specified
 	//
 	mode := ExecUnknown
-	for group := range p.Request.Experiment.Artifacts {
-		if len(group) == 0 {
-			continue
-		}
-		switch group {
-		case "workspace":
-			if mode == ExecUnknown {
-				mode = ExecPythonVEnv
+	func() {
+		for group := range p.Request.Experiment.Artifacts {
+			if len(group) == 0 {
+				continue
 			}
-		case "_singularity":
-			mode = ExecSingularity
-			break
+			switch group {
+			case "workspace":
+				if mode == ExecUnknown {
+					mode = ExecPythonVEnv
+				}
+			case "_singularity":
+				mode = ExecSingularity
+				return
+			}
 		}
-	}
+	}()
 
 	switch mode {
 	case ExecPythonVEnv:
@@ -361,7 +363,7 @@ func (p *processor) copyToMetaData(src string, dest string, jsonDest string) (er
 		// have been output by the experiment
 		if errGo = fastjson.Validate(line); errGo != nil {
 			if logger.IsTrace() {
-				logger.Trace("output json filter failed", "error", errGo, "line", line, "stack", stack.Trace().TrimRuntime())
+				logger.Debug("output json filter failed", "error", errGo, "line", line, "stack", stack.Trace().TrimRuntime())
 			}
 			continue
 		}
@@ -391,7 +393,7 @@ func (p *processor) updateMetaData(group string, artifact runner.Artifact, acces
 
 	metaDir := filepath.Join(expDir, "_metadata")
 	if _, errGo := os.Stat(metaDir); os.IsNotExist(errGo) {
-		os.MkdirAll(metaDir, 0770)
+		_ = os.MkdirAll(metaDir, 0770)
 	}
 
 	switch group {
@@ -443,20 +445,22 @@ func (p *processor) returnAll(ctx context.Context, accessionID string) (warns []
 	for group := range p.Request.Experiment.Artifacts {
 		keys = append(keys, group)
 	}
-	sort.Sort(sort.StringSlice(keys))
+	sort.Strings(keys)
 
 	for _, group := range keys {
 		if artifact, isPresent := p.Request.Experiment.Artifacts[group]; isPresent {
 			if artifact.Mutable {
 				if _, warns, err = p.returnOne(ctx, group, artifact, accessionID); err != nil {
 					return warns, err
+				} else {
+					returned = append(returned, group)
 				}
 			}
 		}
 	}
 
 	if len(returned) != 0 {
-		logger.Info("project returning", "project_id", p.Request.Config.Database.ProjectId, "result", strings.Join(returned, ", "))
+		logger.Info("project returned", "project_id", p.Request.Config.Database.ProjectId, "result", strings.Join(returned, ", "))
 	}
 
 	return warns, nil
@@ -807,7 +811,11 @@ func (p *processor) checkpointStart(ctx context.Context, accessionID string, ref
 // experiment
 func (p *processor) checkpointArtifacts(ctx context.Context, accessionID string, refresh map[string]runner.Artifact) {
 	for group, artifact := range refresh {
-		p.returnOne(ctx, group, artifact, accessionID)
+		if _, _, err := p.returnOne(ctx, group, artifact, accessionID); err != nil {
+			logger.Warn("upload failed", "error", err,
+				"project_id", p.Request.Config.Database.ProjectId, "experiment_id", p.Request.Experiment.Key,
+				"stack", stack.Trace().TrimRuntime())
+		}
 	}
 }
 
@@ -975,8 +983,8 @@ func outputErr(fn string, inErr kv.Error) (err kv.Error) {
 		return kv.Wrap(errGo).With("stack", stack.Trace().TrimRuntime())
 	}
 	defer f.Close()
-	f.WriteString("failed when downloading user data\n")
-	f.WriteString(inErr.Error())
+	_, _ = f.WriteString("failed when downloading user data\n")
+	_, _ = f.WriteString(inErr.Error())
 	return nil
 }
 
@@ -988,7 +996,9 @@ func (p *processor) deployAndRun(ctx context.Context, alloc *runner.Allocated, a
 		// We should always upload results even in the event of an error to
 		// help give the experimenter some clues as to what might have
 		// failed if there is a problem
-		p.returnAll(ctx, accessionID)
+		if _, err := p.returnAll(ctx, accessionID); err != nil {
+			logger.Warn(err.Error())
+		}
 
 		if !*debugOpt {
 			defer os.RemoveAll(p.ExprDir)
